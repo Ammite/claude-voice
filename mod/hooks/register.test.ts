@@ -476,3 +476,39 @@ test('on Linux a chosen session opens through xdg-open', async ($, on) => {
   expect(opened.length).toBe(1)
   for (let i = 0; i < 20; i++) await (await $.ui.mount(BAND)).unmount()
 })
+
+// The rule for the spoken line, as the system prompt holds it.
+async function speechRule($: Parameters<TestBody>[0]) {
+  return (await $.prompt.compose({ model: 'm', promptModel: 'm', surfaces: ['desktop'], tools: [], outputStyle: null, traits: [] })).sections.find(s => s.id === 'voice-wake:speech')?.text ?? ''
+}
+
+// Resolves once the listener is started: the session's start work is done.
+function quietListener(on: Parameters<TestBody>[1]) {
+  on('prompt.compose', () => ({ sections: [] }))
+  let started!: () => void
+  const spawned = new Promise<void>(r => (started = r))
+  on('process.spawn', async function* () {
+    started()
+    await new Promise(() => {})
+    return { value: { code: 0, signal: null } }
+  })
+  return spawned
+}
+
+test('the spoken line is asked for in reply_language from listener/config.json', async ($, on) => {
+  const { files } = engine(on)
+  files.set('/listener/config.json', JSON.stringify({ reply_language: 'ru' }))
+  const spawned = quietListener(on)
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await spawned
+  expect(await speechRule($)).toContain('in Russian')
+})
+
+test('without a config, or with a broken one, the spoken line is in English', async ($, on) => {
+  const { files } = engine(on)
+  files.set('/listener/config.json', '{ not json')
+  const spawned = quietListener(on)
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await spawned
+  expect(await speechRule($)).toContain('in English')
+})

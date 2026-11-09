@@ -14,7 +14,12 @@ const PANE = 'voice-sessions'
 // the reply to such a prompt with a SPEAK line, which the listener reads aloud.
 const VOICE_MARK = '🎙'
 const SPEAK = '🔊'
-const SPEECH_RULE = `Voice replies: a user message that starts with ${VOICE_MARK} was dictated by voice, and one line of your reply to it is read aloud by an English text-to-speech voice when the reply is done. For such messages only, begin your final reply (the text after your last tool call) with one line: "${SPEAK} " followed by one short plain-English sentence (at most 50 words) giving the outcome or the answer, even when the rest of the reply is in another language. No markdown, code, file paths or URLs in that line. Never add it to messages without ${VOICE_MARK}.`
+// The spoken line's language is listener/config.json "reply_language", read once at session start.
+const LANGUAGES: Record<string, string> = { en: 'English', ru: 'Russian', kk: 'Kazakh', uk: 'Ukrainian', de: 'German', fr: 'French', es: 'Spanish' }
+function speechRule(language = 'en') {
+  const name = LANGUAGES[language] ?? language
+  return `Voice replies: a user message that starts with ${VOICE_MARK} was dictated by voice, and one line of your reply to it is read aloud by a text-to-speech voice when the reply is done. For such messages only, begin your final reply (the text after your last tool call) with one line: "${SPEAK} " followed by one short plain sentence in ${name} (at most 50 words) giving the outcome or the answer, even when the rest of the reply is in another language. No markdown, code, file paths or URLs in that line. Never add it to messages without ${VOICE_MARK}.`
+}
 
 const phase = atom({ plugin: 'voice-wake', key: 'phase' } as const, 'off', { shape: 'phase-1' })
 const sessions = atom({ plugin: 'voice-wake', key: 'sessions' } as const, [], { shape: 'sessions-4' })
@@ -52,6 +57,7 @@ let child: AsyncGenerator<unknown, unknown> | undefined
 let runningTurn: string | undefined // the main loop's turn in progress, for «Клод стоп»
 let dir: string | undefined // the listener folder
 let python = '' // its venv interpreter
+let replyLanguage = 'en' // listener/config.json reply_language
 let selfId = ''
 let label = ''
 let since = 0
@@ -441,6 +447,10 @@ export const register: Register = on => {
     const found = await listenerPython($)
     dir = found?.dir
     python = found?.python ?? ''
+    if (dir) {
+      const lang = (await readJson<{ reply_language?: unknown }>($, `${dir}/config.json`))?.reply_language
+      if (typeof lang === 'string' && /^[a-z]{2,3}$/.test(lang)) replyLanguage = lang
+    }
     selfId = await $.session.id()
     if (dir) {
       const old = await readJson<Entry>($, `${reg()}/${selfId}.json`)
@@ -465,7 +475,7 @@ export const register: Register = on => {
   // (not only on voice turns) so the system prompt stays cached.
   on('prompt.compose', async ($, e, next) => {
     const r = await next(e)
-    return { ...r, sections: [...r.sections, { id: 'voice-wake:speech', text: SPEECH_RULE, scope: 'session' as const }] }
+    return { ...r, sections: [...r.sections, { id: 'voice-wake:speech', text: speechRule(replyLanguage), scope: 'session' as const }] }
   })
 
   // The main loop's reply ended: hand its spoken line to the listener (whichever
