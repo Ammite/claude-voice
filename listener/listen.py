@@ -26,10 +26,12 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 RATE = 16000
 BLOCK = 1600  # 0.1 s
+STOP_BLOCKS = 3  # the stop phrase in this many partial results in a row counts as said
 
 DEFAULTS = {
     "wake_phrase": "клод приём",  # words must be in the Vosk vocabulary (it spells ё)
     "stop_phrase": "клод стоп",  # interrupts Claude's running turn at once, no end word needed
+    "cancel_word": "отмена",  # a pause after this word throws the recording away
     "end_word": "приём",  # the message is recorded until this word, however long the pauses
     "submit_on_end": True,  # the end word also sends; False: insert only, send with submit_word
     "submit_word": "отправь",  # with submit_on_end false: "…, отправь, приём" sends
@@ -58,6 +60,16 @@ DEFAULTS = {
 }
 
 PUNCT = r"[\s,.!?:;-]*"
+NUMBERS = "один два три четыре пять шесть семь восемь девять".split()
+
+
+def command_phrases():
+    """Voice commands after "клод" (no end word): phrase -> the line emitted to the mod.
+    Every word must be in the Vosk vocabulary."""
+    out = {"клод какая сессия": {"cmd": "which"}, "клод сотри": {"cmd": "clear"}, "клод повтори": {"cmd": "repeat"}}
+    for n, word in enumerate(NUMBERS, 1):
+        out[f"клод сессия {word}"] = out[f"клод перейди на сессию {word}"] = {"cmd": "session", "n": n}
+    return out
 
 
 def word_re(word):
@@ -157,6 +169,40 @@ def selftest():
     assert speech_pieces("Key principles include KISS, DRY, YAGNI, statelessness, and the CAP theorem.") == [
         "Key principles include KISS,", "DRY, YAGNI, statelessness,", "and the CAP theorem."]
     assert speech_pieces("Done.") == ["Done."]
+    assert command_phrases()["клод перейди на сессию три"] == {"cmd": "session", "n": 3}
+
+    class Rec:  # a Vosk recognizer that plays back (final?, text) per block
+        def __init__(self, script):
+            self.script, self.now = list(script), (False, "")
+
+        def AcceptWaveform(self, _):
+            self.now = self.script.pop(0)
+            return self.now[0]
+
+        def PartialResult(self):
+            return json.dumps({"partial": self.now[1]}, ensure_ascii=False)
+
+        def Result(self):
+            return json.dumps({"text": self.now[1]}, ensure_ascii=False)
+
+        def Reset(self):
+            pass
+
+    class Block:
+        def tobytes(self):
+            return b""
+
+    def heard(script):
+        lst = Listener.__new__(Listener)
+        lst.wake, lst.stop, lst.commands, lst.stop_seen = "клод приём", "клод стоп", command_phrases(), 0
+        lst.rec = Rec(script)
+        return [lst.heard_phrase(Block()) for _ in script]
+
+    p = (False, "клод стоп")
+    assert heard([p, p, p]) == [None, None, "клод стоп"]  # stop from a steady partial, before the pause
+    assert heard([p, (False, ""), p, p]) == [None] * 4  # a flicker is not enough
+    assert heard([(False, "клод сессия"), (True, "клод сессия три")]) == [None, "клод сессия три"]
+    assert heard([(False, "клод приём"), (False, "клод приём"), (False, "клод приём")]) == [None] * 3  # only stop is early
     print("selftest ok")
 
 
@@ -264,7 +310,10 @@ class Listener:
         self.wake = cfg["wake_phrase"].lower()
         self.end = cfg["end_word"].lower()
         self.stop = cfg["stop_phrase"].lower()
-        grammar = [self.wake, self.stop, "[unk]"]
+        self.commands = command_phrases()
+        self.last_said = ""  # for "клод повтори"
+        self.stop_seen = 0  # blocks in a row whose partial result holds the stop phrase
+        grammar = [self.wake, self.stop, *self.commands, "[unk]"]
         self.rec = KaldiRecognizer(self.vosk, RATE, json.dumps(grammar, ensure_ascii=False))
         self.end_rec = KaldiRecognizer(self.vosk, RATE)  # free decoding: only marks pauses
         log("loading whisper...")
@@ -300,22 +349,35 @@ class Listener:
             winsound.Beep(freq, 120)
 
     def heard_phrase(self, block):
-        """Feed a block to the grammar recognizer; the wake or stop phrase once
-        heard (then reset), else None. Final results only: partials under a small
-        grammar fire on almost anything. A final comes after a short pause."""
+        """Feed a block to the grammar recognizer; a grammar phrase once heard
+        (then reset), else None. Final results, which come after a short pause:
+        partials under a small grammar fire on almost anything. The stop phrase
+        alone is taken from a partial too, once it has held for STOP_BLOCKS
+        blocks, so «Клод, стоп» does not wait for the pause."""
         if not self.rec.AcceptWaveform(block.tobytes()):
-            return None
-        heard = f" {json.loads(self.rec.Result()).get('text', '')} "
-        for phrase in (self.wake, self.stop):
+            # ponytail: 0.3 s of a steady partial; raise STOP_BLOCKS if noise ever stops Claude.
+            partial = f" {json.loads(self.rec.PartialResult()).get('partial', '')} "
+            self.stop_seen = self.stop_seen + 1 if f" {self.stop} " in partial else 0
+            if self.stop_seen < STOP_BLOCKS:
+                return None
+            heard = partial
+        else:
+            heard = f" {json.loads(self.rec.Result()).get('text', '')} "
+        self.stop_seen = 0
+        for phrase in (self.wake, self.stop, *self.commands):
             if f" {phrase} " in heard:
                 self.rec.Reset()
                 return phrase
         return None
 
-    def ends_with_end_word(self, audio):
+    def pause_word(self, audio):
+        """What the speech since the last pause ends with: "end", "cancel" or None."""
         tail = self.transcribe(audio)
         log(f"pause, heard: {tail!r}")
-        return re.search(word_re(self.end) + r"[\s,.!?]*$", tail, re.I) is not None
+        for kind, word in (("end", self.end), ("cancel", self.cfg["cancel_word"])):
+            if re.search(word_re(word) + r"[\s,.!?]*$", tail, re.I):
+                return kind
+        return None
 
     def record(self, blocks):
         """Collect blocks after the trigger until the end word. Returns (audio, ended).
@@ -342,8 +404,12 @@ class Listener:
                 heard = json.loads(self.end_rec.Result()).get("text", "")
                 if heard:
                     spoke = True
-                    if t >= c["end_guard_sec"] and self.ends_with_end_word(np.concatenate(out[max(0, seg - overlap) :])):
+                    word = self.pause_word(np.concatenate(out[max(0, seg - overlap) :])) if t >= c["end_guard_sec"] else None
+                    if word == "end":
                         return np.concatenate(out), True
+                    if word == "cancel":
+                        log("cancelled")
+                        return None, False
                 seg = len(out)
             elif json.loads(self.end_rec.PartialResult()).get("partial"):
                 spoke = True
@@ -390,9 +456,10 @@ class Listener:
         self.toast(text, submit)
         return True
 
-    def speak(self, text):
+    def speak(self, text, mic=None):
         """Speak `text` with Kokoro, piece by piece: the next piece is synthesized
-        while one plays. The band's "Замолчать" (cmd "stop") cuts it off."""
+        while one plays. The band's "Замолчать" (cmd "stop") cuts it off, and so
+        does «Клод, стоп» when `mic` (the mic's block queue) is given."""
         import threading
 
         import sounddevice as sd
@@ -409,11 +476,18 @@ class Listener:
                 ready.put(self.tts.create(piece, voice=c["voice"], speed=c["speed"], lang=self.tts_lang()))
             ready.put(None)
 
+        self.last_said = text
         threading.Thread(target=synth, daemon=True).start()
         while (item := ready.get()) is not None:
             sd.play(*item)
             while sd.get_stream().active:
-                if take_cmd() == "stop":
+                said_stop = False
+                while mic is not None and not mic.empty():
+                    said_stop = said_stop or self.feed(mic.get_nowait()) == self.stop
+                if said_stop:
+                    log("stop phrase while speaking")
+                    emit({"stop": True})
+                if said_stop or take_cmd() == "stop":
                     sd.stop()
                     return
                 time.sleep(0.02)
@@ -462,14 +536,20 @@ def run_mic(cfg):
                 lst.beep(440)
                 emit({"stop": True})
                 continue
+            command = lst.commands.get(phrase)
+            if command and command["cmd"] != "repeat":
+                log(f"command: {phrase}")
+                lst.beep(440)
+                emit(command)  # the mod answers "which" and "session" through SAY_FILE
+                continue
             woke = phrase == lst.wake
             pressed = take_cmd() == "dictate"
-            say = take(SAY_FILE)
+            say = take(SAY_FILE) or (command and lst.last_said)
             if say and cfg["speak"]:
                 log(f"say: {say!r}")
                 emit({"status": "speaking"})
                 try:
-                    lst.speak(say)
+                    lst.speak(say, q)
                 except Exception as e:  # no model, no audio device: keep listening
                     log(f"speak failed: {e}")
             elif woke or pressed:
@@ -536,7 +616,7 @@ def main():
     lock = take_lock(cfg["lock_port"])
     if lock is None:
         emit({"status": "busy"})
-        log("another listener already owns the microphone (Claude's? /listen there turns it off); its log: listener/listen.log")
+        log("another listener already owns the microphone (Claude's? /claude-voice-off there turns it off); its log: listener/listen.log")
         sys.exit(3)
     exit_with_parent()
     global LOG_FILE

@@ -57,7 +57,7 @@ const BAND = {
 } as const
 
 const voiceTo = (args: string) => ({
-  command: 'voice-to',
+  command: 'claude-voice-to',
   args,
   origin: { kind: 'composer' as const },
   presentation: { isFullscreen: false, columns: 80 },
@@ -127,7 +127,7 @@ test('the band: "Диктовать" tells the listener, then shows the recordin
   await ui.unmount()
 })
 
-test('voice goes to the session chosen with /voice-to, through its inbox', async ($, on) => {
+test('voice goes to the session chosen with /claude-voice-to, through its inbox', async ($, on) => {
   const { files, file } = engine(on, 'aaa')
   const submits: string[] = []
   let heard!: () => void
@@ -323,5 +323,57 @@ test('a plain checkout: the branch is read from .git/HEAD', async ($, on) => {
   await $.session.start({ cwd: '/work/proj', surface: 'desktop', isInteractive: true })
   expect(JSON.parse(file('/self.json')![1])).toMatchObject({ project: 'proj', branch: 'feature-x' })
   // Let the heartbeat's writes finish before the test ends.
+  for (let i = 0; i < 20; i++) await (await $.ui.mount(BAND)).unmount()
+})
+
+test('«Клод, сессия 2» chooses the second session and says so; «сотри» goes to it; a missing number is said', async ($, on) => {
+  const { files, file, toasts } = engine(on, 'aaa')
+  const fills: unknown[] = []
+  on('prompt.fill', (_, e) => {
+    fills.push({ text: e.text, mode: e.mode })
+    return { isFilled: true }
+  })
+  const reg = sessionsDir()
+  files.set(`${reg}/bbb.json`, JSON.stringify({ id: 'bbb', folder: 'other', branch: 'claude/fix', label: '', seen: 1_000, since: 5 }))
+  let go!: () => void
+  const commands = new Promise<void>(r => (go = r))
+  on('process.spawn', async function* () {
+    yield { stream: 'stdout' as const, text: '{"status": "ready"}\n' }
+    await commands
+    yield { stream: 'stdout' as const, text: '{"cmd": "session", "n": 2}\n' }
+    yield { stream: 'stdout' as const, text: '{"cmd": "which"}\n{"cmd": "clear"}\n{"cmd": "session", "n": 7}\n' }
+    await new Promise(() => {})
+    return { value: { code: 0, signal: null } }
+  })
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  go()
+  // A chain of engine calls per line: wait through engine round trips, not microtasks.
+  for (let i = 0; i < 200 && !file('/listener/say')?.[1]?.startsWith('There is no'); i++) await (await $.ui.mount(BAND)).unmount()
+  expect(files.get(`${reg}/target`)).toBe('bbb')
+  // «Сотри» goes where voice goes: the chosen session clears its own box.
+  expect(JSON.parse(files.get(`${reg}/bbb.inbox`)!)).toMatchObject({ cmd: 'clear' })
+  expect(fills).toEqual([])
+  expect(file('/listener/say')?.[1]).toBe('There is no session 7. There are 2.')
+  expect(toasts).toEqual(['🎙 Session 2, other, fix.', '🎙 Voice goes to session 2, other, fix.', '🎙 There is no session 7. There are 2.'])
+  for (let i = 0; i < 20; i++) await (await $.ui.mount(BAND)).unmount()
+})
+
+test('/claude-voice-off and /claude-voice-on turn voice input off and on', async ($, on) => {
+  engine(on)
+  const stored: unknown[] = []
+  on('store.set', (_, e) => {
+    stored.push(e.value)
+    return { value: undefined }
+  })
+  on('process.spawn', async function* () {
+    await new Promise(() => {})
+    return { value: { code: 0, signal: null } }
+  })
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  const run = (command: string) => $.command.run({ ...voiceTo(''), command })
+  expect((await run('claude-voice-off')).text).toContain('выключен')
+  expect((await run('claude-voice-on')).text).toContain('включён')
+  await until(async () => stored.length === 2)
+  expect(stored).toEqual([false, true])
   for (let i = 0; i < 20; i++) await (await $.ui.mount(BAND)).unmount()
 })

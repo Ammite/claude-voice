@@ -33,7 +33,9 @@ const STATUS: Record<Phase, string> = {
   'not-installed': '🎙 not installed',
 }
 
-type Line = { text?: string; submit?: boolean; status?: string; stop?: boolean }
+// A listener line. `cmd` comes from a voice command (no end word): «Клод, какая сессия»
+// (which), «Клод, сессия три» (session, n), «Клод, сотри» (clear the prompt box).
+type Line = { text?: string; submit?: boolean; status?: string; stop?: boolean; cmd?: 'which' | 'session' | 'clear'; n?: number }
 // What each session writes about itself into listener/sessions/<id>.json.
 type Entry = {
   id: string
@@ -97,7 +99,7 @@ async function refreshSessions($: EngineInterface) {
   // No choice (or a closed one): voice goes to the mic's session.
   const target = alive.some(e => e.id === chosen) ? chosen : owner.trim()
   // This session first, then the others in the order they appeared: a new one
-  // goes last, so the numbers already shown stay. The place is /voice-to's number.
+  // goes last, so the numbers already shown stay. The place is /claude-voice-to's number.
   const order = alive.sort(
     (a, b) =>
       Number(b.id === selfId) - Number(a.id === selfId) || (a.since ?? 0) - (b.since ?? 0) || a.id.localeCompare(b.id),
@@ -214,7 +216,35 @@ async function giveBack($: EngineInterface, text: string, why: string) {
   $.ui.log(`voice-wake: prompt dropped: ${why}`)
 }
 
+/** Have the mic's listener say `text` (and keep it on the band); a toast too, for when speech is off. */
+async function sayAloud($: EngineInterface, text: string) {
+  $.ui.toast(`🎙 ${text}`)
+  if (!dir || !(await isEnabled($))) return
+  await $.fs.write(`${dir}/said`, text)
+  await $.fs.write(`${dir}/say`, text)
+}
+
+/** «Клод, какая сессия» and «Клод, сессия n»: the numbers are the sessions pane's. */
+async function voiceCommand($: EngineInterface, line: Line) {
+  await refreshSessions($)
+  const list = await read($, sessions)
+  const spoken = (s: VoiceSession) => s.name.replace(/ · /g, ', ')
+  if (line.cmd === 'which') {
+    const i = list.findIndex(s => s.isTarget)
+    return sayAloud($, i < 0 ? 'Voice goes to this session.' : `Voice goes to session ${i + 1}, ${spoken(list[i])}.`)
+  }
+  const n = line.n ?? 0
+  const chosen = list[n - 1]
+  if (!chosen) return sayAloud($, `There is no session ${n}. There are ${list.length}.`)
+  await select($, chosen.id)
+  return sayAloud($, `Session ${n}, ${spoken(chosen)}.`)
+}
+
 async function deliver($: EngineInterface, line: Line) {
+  if (line.cmd === 'clear') {
+    await $.prompt.fill({ text: '', mode: 'replace' })
+    return
+  }
   if (line.stop) {
     if (!runningTurn) return
     await $.turn.abort({ turnId: runningTurn }).catch(() => undefined) // it may have just ended
@@ -306,7 +336,8 @@ async function run($: EngineInterface) {
         if (line.status === 'transcribing') await setPhase($, 'transcribing')
         if (line.status === 'speaking') await setPhase($, 'speaking')
         if (line.status === 'busy') busy = true
-        if (line.text !== undefined || line.stop) await route($, line)
+        if (line.cmd === 'which' || line.cmd === 'session') await voiceCommand($, line)
+        if (line.text !== undefined || line.stop || line.cmd === 'clear') await route($, line)
       }
     }
   } catch (err) {
@@ -346,14 +377,24 @@ async function send($: EngineInterface, cmd: 'dictate' | 'stop') {
   if (dir) await $.fs.write(`${dir}/cmd`, cmd)
 }
 
+/** /claude-voice, -on, -off: the setting is shared by every session. */
+async function toggle($: EngineInterface, enable: boolean) {
+  void setEnabled($, enable)
+  return enable
+    ? { text: 'Голосовой ввод включён: скажи «Клод приём», сообщение и «приём» в конце.' }
+    : { text: 'Голосовой ввод выключен (во всех сеансах).' }
+}
+
 const openPane = ($: EngineInterface) => $.ui.open({ id: PANE, title: 'Голосовой ввод: сессии' })
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     const started = await next(e)
-    await $.command.register({ name: 'listen', description: 'Голосовой ввод «Клод приём»: включить / выключить' })
+    await $.command.register({ name: 'claude-voice', description: 'Голосовой ввод «Клод приём»: включить / выключить' })
+    await $.command.register({ name: 'claude-voice-on', description: 'Голосовой ввод: включить во всех сеансах' })
+    await $.command.register({ name: 'claude-voice-off', description: 'Голосовой ввод: выключить во всех сеансах (микрофон, речь)' })
     await $.command.register({
-      name: 'voice-to',
+      name: 'claude-voice-to',
       description: 'Куда идёт голосовой ввод: без аргумента — список сессий, с номером — выбрать',
       argumentHint: '[номер сессии]',
     })
@@ -410,15 +451,11 @@ export const register: Register = on => {
     return next(e)
   })
 
-  on('command.run', { command: 'listen' }, async $ => {
-    const enable = !(await isEnabled($))
-    void setEnabled($, enable)
-    return enable
-      ? { text: 'Голосовой ввод включён: скажи «Клод приём», сообщение и «приём» в конце.' }
-      : { text: 'Голосовой ввод выключен (во всех сеансах).' }
-  })
+  on('command.run', { command: 'claude-voice' }, async $ => toggle($, !(await isEnabled($))))
+  on('command.run', { command: 'claude-voice-on' }, async $ => toggle($, true))
+  on('command.run', { command: 'claude-voice-off' }, async $ => toggle($, false))
 
-  on('command.run', { command: 'voice-to' }, async ($, e) => {
+  on('command.run', { command: 'claude-voice-to' }, async ($, e) => {
     await refreshSessions($)
     const list = await read($, sessions)
     const n = Number.parseInt(e.args.trim(), 10)
@@ -438,7 +475,7 @@ export const register: Register = on => {
   })
 
   // The sessions pane: this session first, then the others in the order they
-  // appeared; the number is the one /voice-to takes, and its hotkey.
+  // appeared; the number is the one /claude-voice-to and «Клод, сессия n» take, and its hotkey.
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Button, Text } = $.ui.resolve(e)
     const list = await read($, sessions)
@@ -462,7 +499,7 @@ export const register: Register = on => {
           ))}
         </Box>
         {list.length === 0 && <Text dimColor>Нет сессий с модом.</Text>}
-        <Text dimColor>Без выбора голос идёт в сессию с микрофоном. Номер = /voice-to n.</Text>
+        <Text dimColor>Без выбора голос идёт в сессию с микрофоном. Номер = /claude-voice-to n или «Клод, сессия n».</Text>
       </Box>
     )
   })

@@ -1,1 +1,1 @@
-{"name": "voice-wake", "version": "0.5.0", "license": "MIT", "description": "Hands-free voice input: say \"Клод приём\", speak, end with \"приём\"; the text lands in the prompt", "types": "./types/index.d.ts"}
+{"name": "voice-wake", "version": "0.6.0", "license": "MIT", "description": "Hands-free voice input: say \"Клод приём\", speak, end with \"приём\"; the text lands in the prompt", "types": "./types/index.d.ts"}
