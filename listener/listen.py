@@ -9,6 +9,7 @@ like {"status": "..."}; logs go to stderr.
   python listen.py --levels     # print mic RMS levels to tune energy_threshold
   python listen.py --wav f.wav  # run the pipeline on a 16 kHz mono wav (no mic)
   python listen.py --selftest   # check the text rules
+  python listen.py --usage       # what the cloud (Soniox) calls cost, by day
   python listen.py --say "Hi"   # speak a line with the reply voice (Kokoro)
 
 The mod writes a reply's spoken line to listener/say; the mic loop speaks it
@@ -24,6 +25,7 @@ import time
 from pathlib import Path
 
 import cloud
+import usage
 
 HERE = Path(__file__).resolve().parent
 RATE = 16000
@@ -125,6 +127,7 @@ def emit(obj):
 
 
 CMD_FILE = HERE / "cmd"  # the mod writes "dictate" or "stop" here (its band's buttons)
+USAGE_FILE = HERE / "usage.jsonl"  # one line per cloud call: what it cost
 SAY_FILE = HERE / "say"  # the mod writes a reply's spoken line here
 
 
@@ -337,13 +340,23 @@ def selftest_cloud_fallback():
             raise r
         return r
 
+    import tempfile
+
+    global USAGE_FILE
+    real_usage = USAGE_FILE
+    tmp = tempfile.TemporaryDirectory()
+    USAGE_FILE = Path(tmp.name) / "usage.jsonl"
     cloud.transcribe = fake
     try:
-        audio = np.zeros(10, dtype=np.int16)
+        audio = np.zeros(RATE * 2, dtype=np.int16)
         lst = listener()
         replies[:] = ["облако", cloud.CloudError("net"), "облако"]
-        assert [lst.transcribe(audio) for _ in range(3)] == ["облако", "локально", "облако"]
+        assert [lst.transcribe(audio) for _ in range(2)] == ["облако", "локально"]
+        assert lst.transcribe(audio, kind="stt-pause") == "облако"
         assert lst.cloud_stt
+        # only what the cloud recognized is counted: two calls, 2 s of audio each
+        logged = usage.load(USAGE_FILE)
+        assert [(e["kind"], e["audio_sec"], e["chars"]) for e in logged] == [("stt", 2.0, 6), ("stt-pause", 2.0, 6)]
         replies[:] = [cloud.CloudError("net")] * STT_MAX_FAILURES
         for _ in range(STT_MAX_FAILURES):
             lst.transcribe(audio)
@@ -354,6 +367,8 @@ def selftest_cloud_fallback():
         assert lst.transcribe(audio) == "локально"  # no second cloud call: replies would be empty
     finally:
         cloud.transcribe = real
+        USAGE_FILE = real_usage
+        tmp.cleanup()
 
     assert not listener(key="").cloud_stt  # chosen, but no key: local
     assert not listener(stt="whisper").cloud_stt
@@ -363,6 +378,7 @@ def selftest_cloud_fallback():
 
 def selftest():
     cloud.selftest()
+    usage.selftest()
     selftest_cloud_fallback()
     w = "отправь"
     assert clean("Клод, приём. Привет, приём.", w) == ("Привет", False)
@@ -658,7 +674,7 @@ class Listener:
 
     def pause_word(self, audio):
         """What the speech since the last pause ends with: "end", "cancel" or None."""
-        tail = self.transcribe(audio)
+        tail = self.transcribe(audio, kind="stt-pause")
         log(f"pause, heard: {tail!r}")
         for kind, word in (("end", self.end), ("cancel", self.cfg["cancel_word"])):
             if re.search(word_re(word) + r"[\s,.!?]*$", tail, re.I):
@@ -711,12 +727,13 @@ class Listener:
                 break
         return np.concatenate(out), False
 
-    def transcribe(self, audio):
+    def transcribe(self, audio, kind="stt"):
         """Soniox when chosen; whisper after a failure. A bad key, or STT_MAX_FAILURES
         failures in a row, leaves the cloud for the rest of the run."""
         if self.cloud_stt:
             try:
                 text = cloud.transcribe(audio, self.key, self.cfg["language"], self.cfg["soniox_terms"])
+                usage.record(USAGE_FILE, kind, cloud.STT_MODEL, len(audio) / RATE, len(text))
                 self.stt_failures = 0
                 return text
             except cloud.CloudError as e:
@@ -785,7 +802,9 @@ class Listener:
         def piece_audio(piece):
             if self.cloud_tts:
                 try:
-                    return cloud.synthesize(piece, self.key, c["reply_language"], c["soniox_voice"])
+                    audio, rate = cloud.synthesize(piece, self.key, c["reply_language"], c["soniox_voice"])
+                    usage.record(USAGE_FILE, "tts", cloud.TTS_MODEL, len(audio) / rate, len(piece))
+                    return audio, rate
                 except cloud.CloudError as e:
                     if e.fatal:
                         self.cloud_tts = False
@@ -933,6 +952,8 @@ def main():
     if "--selftest" in args:
         return selftest()
     cfg = load_config()
+    if "--usage" in args:
+        return print(usage.report(USAGE_FILE))
     if "--levels" in args:
         return run_levels(cfg)
     if "--wav" in args:

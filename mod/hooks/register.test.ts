@@ -512,3 +512,28 @@ test('without a config, or with a broken one, the spoken line is in English', as
   await spawned
   expect(await speechRule($)).toContain('in English')
 })
+
+test('/claude-voice-usage shows the report the listener prints', async ($, on) => {
+  engine(on)
+  on('prompt.compose', () => ({ sections: [] }))
+  let started!: () => void
+  const spawned = new Promise<void>(r => (started = r))
+  const runs: string[][] = []
+  on('process.spawn', async function* (_, e) {
+    runs.push([...e.argv])
+    if (e.argv.includes('--usage')) {
+      yield { stream: 'stdout' as const, text: 'total: stt $0.0100\n' }
+      return { value: { code: 0, signal: null } }
+    }
+    started()
+    await new Promise(() => {})
+    return { value: { code: 0, signal: null } }
+  })
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await spawned
+
+  const r = await $.command.run({ ...voiceTo(''), command: 'claude-voice-usage' })
+  expect(r).toEqual({ text: 'total: stt $0.0100' })
+  const [script, flag] = runs.at(-1)!.slice(-2)
+  expect(script.endsWith('/listener/listen.py') && flag === '--usage').toBe(true)
+})

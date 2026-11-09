@@ -11,7 +11,7 @@ import urllib.request
 from pathlib import Path
 
 STT_URL = "wss://stt-rt.soniox.com/transcribe-websocket"
-STT_MODEL = "stt-rt-v5"
+STT_MODEL = "stt-rt-v6"
 TTS_URL = "https://tts-rt.soniox.com/tts"
 TTS_MODEL = "tts-rt-v2"
 USER_AGENT = "claude-voice/1.0"  # Soniox answers 403 to the default Python user agent

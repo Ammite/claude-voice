@@ -10,3 +10,4 @@ listener/sessions/*
 listener/said
 listener/say
 decisions/
+listener/usage.jsonl

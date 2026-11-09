@@ -439,6 +439,7 @@ export const register: Register = on => {
     await $.command.register({ name: 'claude-voice', description: 'Голосовой ввод «Клод приём»: включить / выключить' })
     await $.command.register({ name: 'claude-voice-on', description: 'Голосовой ввод: включить во всех сеансах' })
     await $.command.register({ name: 'claude-voice-off', description: 'Голосовой ввод: выключить во всех сеансах (микрофон, речь)' })
+    await $.command.register({ name: 'claude-voice-usage', description: 'Голосовой ввод: сколько стоит облако (Soniox) по дням' })
     await $.command.register({
       name: 'claude-voice-to',
       description: 'Куда идёт голосовой ввод: без аргумента — список сессий, с номером — выбрать',
@@ -506,6 +507,19 @@ export const register: Register = on => {
   on('command.run', { command: 'claude-voice' }, async $ => toggle($, !(await isEnabled($))))
   on('command.run', { command: 'claude-voice-on' }, async $ => toggle($, true))
   on('command.run', { command: 'claude-voice-off' }, async $ => toggle($, false))
+
+  // The report is the listener's own (listener/usage.py): one place knows the prices.
+  on('command.run', { command: 'claude-voice-usage' }, async $ => {
+    if (!dir) return { text: 'Слушатель не установлен: python listener/install.py' }
+    let out = ''
+    try {
+      for await (const chunk of $.process.spawn({ argv: [python, `${dir}/listen.py`, '--usage'], cwd: dir, env: { PYTHONIOENCODING: 'utf-8' } }))
+        if (chunk.stream === 'stdout') out += chunk.text
+    } catch (err) {
+      return { text: `Не удалось получить отчёт: ${String(err)}` }
+    }
+    return { text: out.trim() }
+  })
 
   on('command.run', { command: 'claude-voice-to' }, async ($, e) => {
     await refreshSessions($)
