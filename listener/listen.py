@@ -30,6 +30,7 @@ STOP_BLOCKS = 3  # the stop phrase in this many partial results in a row counts 
 
 DEFAULTS = {
     "wake_phrase": "клод приём",  # words must be in the Vosk vocabulary (it spells ё)
+    "text_phrase": "клод текст",  # like the wake phrase, but the message is only inserted, never sent
     "stop_phrase": "клод стоп",  # interrupts Claude's running turn at once, no end word needed
     "cancel_word": "отмена",  # a pause after this word throws the recording away
     "end_word": "приём",  # the message is recorded until this word, however long the pauses
@@ -94,6 +95,8 @@ def speech_pieces(text, min_len=25):
 # Leading "Клод" as whisper may spell it, stripped from the transcript; the
 # rest of the wake phrase ("приём") is stripped by clean().
 WAKE_PREFIX = re.compile(r"^\s*(клод|клот|клоуд|клауд|клод[ауе]|claude|clod|claud)\b" + PUNCT, re.I)
+# What may follow "Клод" in the preroll of «Клод, текст»: stripped like "приём".
+TEXT_PREFIX = re.compile(r"^\s*(текст|text)\b" + PUNCT, re.I)
 
 
 def log(*a):
@@ -140,6 +143,7 @@ def clean(text, submit_word, end_word="приём"):
     """Strip "Клод приём" in front, the end word and the submit word at the end.
     Returns (text, submit)."""
     text = WAKE_PREFIX.sub("", text.strip())
+    text = TEXT_PREFIX.sub("", text)
     # The preroll often holds only the tail of the wake phrase ("приём"), so a
     # leading end word is always dropped. ponytail: eats a message that really
     # starts with "приём"; say something before it if that matters.
@@ -163,7 +167,9 @@ def selftest():
     assert clean("Приём. Привет, приём.", w) == ("Привет", False)  # preroll without "Клод"
     assert clean("отправьте письмо Пете приём", w) == ("Отправьте письмо Пете", False)
     assert clean("Клод приём отправь приём", w) == ("", True)
-    assert clean("Привет", w) == ("Привет", False)  # end word missed by whisper: still fine
+    assert clean("Привет", w) == ("Привет", False)
+    assert clean("Клод, текст. Купить молоко, приём.", w) == ("Купить молоко", False)
+    assert clean("Текст, привет, приём", w) == ("Привет", False)  # preroll without "Клод"  # end word missed by whisper: still fine
     assert clean("Claude. Write a test. Send. Over.", "send", "over") == ("Write a test", True)
     assert clean("Преем. Какие еще есть принципы? Скажи список. Преем.", w) == ("Какие еще есть принципы? Скажи список", False)
     assert speech_pieces("Key principles include KISS, DRY, YAGNI, statelessness, and the CAP theorem.") == [
@@ -195,6 +201,7 @@ def selftest():
     def heard(script):
         lst = Listener.__new__(Listener)
         lst.wake, lst.stop, lst.commands, lst.stop_seen = "клод приём", "клод стоп", command_phrases(), 0
+        lst.text_only = "клод текст"
         lst.rec = Rec(script)
         return [lst.heard_phrase(Block()) for _ in script]
 
@@ -202,6 +209,7 @@ def selftest():
     assert heard([p, p, p]) == [None, None, "клод стоп"]  # stop from a steady partial, before the pause
     assert heard([p, (False, ""), p, p]) == [None] * 4  # a flicker is not enough
     assert heard([(False, "клод сессия"), (True, "клод сессия три")]) == [None, "клод сессия три"]
+    assert heard([(True, "клод текст")]) == ["клод текст"]
     assert heard([(False, "клод приём"), (False, "клод приём"), (False, "клод приём")]) == [None] * 3  # only stop is early
     print("selftest ok")
 
@@ -310,10 +318,11 @@ class Listener:
         self.wake = cfg["wake_phrase"].lower()
         self.end = cfg["end_word"].lower()
         self.stop = cfg["stop_phrase"].lower()
+        self.text_only = cfg["text_phrase"].lower()
         self.commands = command_phrases()
         self.last_said = ""  # for "клод повтори"
         self.stop_seen = 0  # blocks in a row whose partial result holds the stop phrase
-        grammar = [self.wake, self.stop, *self.commands, "[unk]"]
+        grammar = [self.wake, self.text_only, self.stop, *self.commands, "[unk]"]
         self.rec = KaldiRecognizer(self.vosk, RATE, json.dumps(grammar, ensure_ascii=False))
         self.end_rec = KaldiRecognizer(self.vosk, RATE)  # free decoding: only marks pauses
         log("loading whisper...")
@@ -364,7 +373,7 @@ class Listener:
         else:
             heard = f" {json.loads(self.rec.Result()).get('text', '')} "
         self.stop_seen = 0
-        for phrase in (self.wake, self.stop, *self.commands):
+        for phrase in (self.wake, self.text_only, self.stop, *self.commands):
             if f" {phrase} " in heard:
                 self.rec.Reset()
                 return phrase
@@ -437,8 +446,9 @@ class Listener:
         )
         return " ".join(s.text.strip() for s in segs).strip()
 
-    def handle(self, blocks):
-        """Process one utterance after the wake word. Returns True if something was emitted."""
+    def handle(self, blocks, insert_only=False):
+        """Process one utterance after the wake word. Returns True if something was emitted.
+        `insert_only` (after «Клод, текст»): the text goes into the box, never sent."""
         emit({"status": "recording"})
         self.beep(880)
         audio, ended = self.record(blocks)
@@ -450,7 +460,7 @@ class Listener:
         raw = self.transcribe(audio)
         text, submit = clean(raw, self.cfg["submit_word"], self.end)
         # Cut off by max_sec: never send. Nothing said: send the draft only on an explicit "отправь".
-        submit = ended and (submit or (self.cfg["submit_on_end"] and bool(text)))
+        submit = ended and not insert_only and (submit or (self.cfg["submit_on_end"] and bool(text)))
         log(f"heard: {raw!r} ended={ended}")
         if not text and not submit:  # "Клод, отправь" alone sends the draft
             self.beep(330)
@@ -546,7 +556,7 @@ def run_mic(cfg):
                 lst.beep(440)
                 emit(command)  # the mod answers "which" and "session" through SAY_FILE
                 continue
-            woke = phrase == lst.wake
+            woke = phrase in (lst.wake, lst.text_only)
             pressed = take_cmd() == "dictate"
             say = take(SAY_FILE) or (command and lst.last_said)
             if say and cfg["speak"]:
@@ -557,10 +567,10 @@ def run_mic(cfg):
                 except Exception as e:  # no model, no audio device: keep listening
                     log(f"speak failed: {e}")
             elif woke or pressed:
-                log("wake phrase" if woke else "dictate button")
+                log(f"wake phrase: {phrase}" if woke else "dictate button")
                 if pressed:
                     lst.history.clear()  # the preroll is for the wake phrase, not a button
-                lst.handle(blocks())
+                lst.handle(blocks(), insert_only=phrase == lst.text_only)
             else:
                 continue
             while not q.empty():  # drop audio captured while busy (incl. our beeps and speech)
