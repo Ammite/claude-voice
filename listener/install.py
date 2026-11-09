@@ -1,6 +1,11 @@
-"""One-time setup: venv, deps, models. Run: python listener/install.py"""
+"""One-time setup: venv, deps, models. Run: python listener/install.py [--gpu | --cpu]
+
+The CUDA libraries (~2 GB) are installed only with an NVIDIA card (found by
+`nvidia-smi -L`) or --gpu; --cpu skips them. Whisper runs on the CPU without them.
+"""
 import hashlib
 import io
+import shutil
 import subprocess
 import sys
 import urllib.request
@@ -30,6 +35,17 @@ if not PY.exists():
     print("creating venv...")
     venv.create(VENV, with_pip=True)
 subprocess.check_call([str(PY), "-m", "pip", "install", "-q", "-r", str(HERE / "requirements.txt")])
+
+
+def has_nvidia():
+    smi = shutil.which("nvidia-smi")  # comes with the NVIDIA driver
+    return bool(smi) and subprocess.run([smi, "-L"], capture_output=True, text=True).stdout.startswith("GPU")
+
+
+gpu = "--gpu" in sys.argv or ("--cpu" not in sys.argv and has_nvidia())
+print(f"GPU: {'NVIDIA, installing CUDA libraries (~2 GB)' if gpu else 'none, whisper runs on the CPU'}")
+if gpu:
+    subprocess.check_call([str(PY), "-m", "pip", "install", "-q", "-r", str(HERE / "requirements-cuda.txt")])
 
 MODELS.mkdir(exist_ok=True)
 if not (MODELS / VOSK).exists():

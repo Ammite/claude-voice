@@ -235,8 +235,9 @@ def load_whisper(path, device):
     import numpy as np
     from faster_whisper import WhisperModel
 
-    if device in ("auto", "cuda"):
-        nvidia = Path(sys.prefix) / "Lib" / "site-packages" / "nvidia"
+    nvidia = Path(sys.prefix) / "Lib" / "site-packages" / "nvidia"
+    # "auto" without the CUDA libraries (install.py skips them with no NVIDIA card): CPU, no try.
+    if device == "cuda" or (device == "auto" and nvidia.exists()):
         for bin_dir in nvidia.glob("*/bin"):
             os.add_dll_directory(str(bin_dir))
             os.environ["PATH"] = f"{bin_dir}{os.pathsep}{os.environ['PATH']}"

@@ -1,0 +1,3 @@
+# NVIDIA only (~2 GB): whisper on the GPU. install.py adds these when it finds an NVIDIA card.
+nvidia-cublas-cu12==12.9.2.10
+nvidia-cudnn-cu12==9.28.1.4

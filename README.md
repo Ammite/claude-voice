@@ -22,7 +22,20 @@ python listener/install.py
 
 Скрипт создаёт `listener/.venv`, ставит зависимости из `requirements.txt` и скачивает
 в `listener/models/` Vosk `vosk-model-small-ru-0.22` (~45 МБ) и faster-whisper `small`
-(~480 МБ). В конце прогоняет самопроверку.
+(~480 МБ), голос Kokoro (~340 МБ). В конце прогоняет самопроверку.
+
+Видеокарта. Если `nvidia-smi -L` находит карту NVIDIA, скрипт ещё ставит CUDA-библиотеки
+из `requirements-cuda.txt`, и whisper распознаёт на видеокарте. Остальным (AMD, Intel,
+без видеокарты) они не ставятся, whisper работает на процессоре: распознавание медленнее,
+зато установка меньше.
+
+| | Занимает | Whisper |
+| --- | --- | --- |
+| NVIDIA | ~3,2 ГБ | видеокарта |
+| остальные | ~1,2 ГБ | процессор |
+
+Выбрать вручную: `python listener/install.py --gpu` или `--cpu`. `--cpu` только не ставит
+CUDA; чтобы удалить уже поставленную, удали `listener/.venv` и запусти `install.py --cpu`.
 
 Проверка без Claude:
 
@@ -154,7 +167,7 @@ worktree), ветка — из `.git/HEAD` без префикса `claude/`. У
 | `language` | `"ru"` | `"ru"`, `"en"` или `"auto"` (на коротких фразах auto ошибается чаще) |
 | `submit_word` | `"отправь"` | при `submit_on_end: false`: «…, отправь, приём» отправляет |
 | `whisper_model` | `models/faster-whisper-small` | путь к модели whisper |
-| `whisper_device` | `"auto"` | `"auto"` — видеокарта NVIDIA, если работает, иначе процессор; `"cuda"`, `"cpu"` |
+| `whisper_device` | `"auto"` | `"auto"` — видеокарта NVIDIA, если CUDA установлена и работает, иначе процессор; `"cuda"`, `"cpu"` |
 | `beam_size` | `5` | `1` быстрее, `5` реже ошибается |
 | `whisper_prompt` | термины | слова, которые часто говоришь: whisper будет писать их правильно |
 | `beep`, `toast` | `true` | писки и уведомления Windows |

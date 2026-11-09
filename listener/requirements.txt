@@ -4,5 +4,3 @@ sounddevice==0.5.1
 numpy<2.3
 winotify==1.1.0
 kokoro-onnx==0.6.1
-nvidia-cublas-cu12==12.9.2.10
-nvidia-cudnn-cu12==9.28.1.4
