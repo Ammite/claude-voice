@@ -1,0 +1,9 @@
+listener/.venv/
+listener/models/
+listener/config.json
+__pycache__/
+mod/.claude-plugin/types/
+listener/listen.log
+listener/cmd
+listener/sessions/*
+!listener/sessions/.gitkeep
