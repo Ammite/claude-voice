@@ -2,5 +2,5 @@ vosk==0.3.45
 faster-whisper==1.1.1
 sounddevice==0.5.1
 numpy<2.3
-winotify==1.1.0
+winotify==1.1.0; sys_platform == "win32"
 kokoro-onnx==0.6.1

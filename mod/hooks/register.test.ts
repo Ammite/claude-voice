@@ -7,7 +7,7 @@ const sessionsDir = () => '/listener/sessions'
 
 // The engine beneath the mod: what every test here needs answered, with an
 // in-memory file system (returned) for listener/sessions/.
-function engine(on: Parameters<TestBody>[1], id = 'self', afterFires = false, cwd = '/work/proj') {
+function engine(on: Parameters<TestBody>[1], id = 'self', afterFires = false, cwd = '/work/proj', exists = (_path: string) => true) {
   const files = new Map<string, string>()
   // The engine hands paths resolved for this OS (C:\work\...): keep them as /work/...
   const norm = (p: string) => p.replace(/\\/g, '/').replace(/^[A-Za-z]:/, '').replace(/^.*\/listener\//, '/listener/')
@@ -17,7 +17,7 @@ function engine(on: Parameters<TestBody>[1], id = 'self', afterFires = false, cw
   on('session.cwd', () => ({ value: cwd }))
   on('command.register', () => ({ value: { command: 'x' } }))
   on('store.get', () => ({ value: undefined }))
-  on('fs.stat', () => ({ value: { kind: 'file', size: 1 } as never }))
+  on('fs.stat', (_, e) => (exists(e.path) ? { value: { kind: 'file', size: 1 } as never } : { deny: 'ENOENT' }))
   on('fs.read', (_, e) => {
     const text = files.get(norm(e.path))
     if (text === undefined) return { deny: 'ENOENT' }
@@ -425,6 +425,51 @@ test('choosing a session opens it in Claude Desktop; choosing the shown one clea
   expect(files.get(`${reg}/target`)).toBe('bbb')
   await until(async () => opened.length > 0)
   expect(opened).toEqual([['cmd', '/c', 'start', '', 'claude://claude.ai/epitaxy/local_b2']])
+
+  await $.command.run(voiceTo('1')) // this one, on screen: the default again, nothing to open
+  expect(files.get(`${reg}/target`)).toBe('')
+  expect(opened.length).toBe(1)
+  for (let i = 0; i < 20; i++) await (await $.ui.mount(BAND)).unmount()
+})
+
+test('on Linux the listener runs from the venv at .venv/bin/python', async ($, on) => {
+  engine(on, 'self', false, '/work/proj', path => path.endsWith('/.venv/bin/python'))
+  let spawned!: (argv: string[]) => void
+  const argv = new Promise<string[]>(r => (spawned = r))
+  on('process.spawn', async function* (_, e) {
+    spawned([...e.argv])
+    await new Promise(() => {})
+    return { value: { code: 0, signal: null } }
+  })
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+
+  const [python, , script] = await argv
+  expect(python.endsWith('/listener/.venv/bin/python')).toBe(true)
+  expect(script.endsWith('/listener/listen.py')).toBe(true)
+})
+
+test('on Linux a chosen session opens through xdg-open', async ($, on) => {
+  const { files } = engine(on, 'aaa', false, '/work/proj', path => !path.endsWith('.exe'))
+  const opened: string[][] = []
+  on('process.spawn', async function* (_, e) {
+    if (e.argv[0] === 'xdg-open') {
+      opened.push([...e.argv])
+      return { value: { code: 0, signal: null } }
+    }
+    await new Promise(() => {}) // the listener: stays quiet
+    return { value: { code: 0, signal: null } }
+  })
+  const reg = sessionsDir()
+  files.set(`${reg}/bbb.json`, JSON.stringify({ id: 'bbb', folder: 'other', label: '', seen: 1_000, since: 2 }))
+  files.set(`${reg}/focused`, 'aaa')
+  files.set(`${reg}/desktop-ids.json`, JSON.stringify({ bbb: 'local_b2', aaa: 'local_a1' }))
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+
+  await $.command.run(voiceTo('2')) // bbb: not on screen
+  expect(files.get(`${reg}/target`)).toBe('bbb')
+  await until(async () => opened.length > 0)
+  expect(opened).toEqual([['xdg-open', 'claude://claude.ai/epitaxy/local_b2']])
 
   await $.command.run(voiceTo('1')) // this one, on screen: the default again, nothing to open
   expect(files.get(`${reg}/target`)).toBe('')

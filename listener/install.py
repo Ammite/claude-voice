@@ -15,7 +15,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 VENV = HERE / ".venv"
-PY = VENV / "Scripts" / "python.exe"
+PY = VENV / "Scripts" / "python.exe" if sys.platform == "win32" else VENV / "bin" / "python"
 MODELS = HERE / "models"
 VOSK = "vosk-model-small-ru-0.22"
 # Downloads are checked against these before use: a swapped file is refused, not loaded.

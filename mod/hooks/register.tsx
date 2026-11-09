@@ -51,6 +51,7 @@ type Entry = {
 let child: AsyncGenerator<unknown, unknown> | undefined
 let runningTurn: string | undefined // the main loop's turn in progress, for «Клод стоп»
 let dir: string | undefined // the listener folder
+let python = '' // its venv interpreter
 let selfId = ''
 let label = ''
 let since = 0
@@ -176,7 +177,10 @@ async function select($: EngineInterface, id: string) {
 async function openInDesktop($: EngineInterface, id: string) {
   const desktopId = (await readJson<Record<string, string>>($, `${reg()}/desktop-ids.json`))?.[id]
   if (!desktopId || !/^local_[\w-]+$/.test(desktopId)) return
-  const proc = $.process.spawn({ argv: ['cmd', '/c', 'start', '', `claude://claude.ai/epitaxy/${desktopId}`] })
+  const link = `claude://claude.ai/epitaxy/${desktopId}`
+  // the venv layout tells the OS: Windows has Scripts/python.exe
+  const argv = python.endsWith('.exe') ? ['cmd', '/c', 'start', '', link] : ['xdg-open', link]
+  const proc = $.process.spawn({ argv })
   // ponytail: a failed start (no claude:// handler) is only logged; the choice still holds.
   void (async () => {
     try {
@@ -218,12 +222,17 @@ async function setPhase($: EngineInterface, p: Phase) {
   await update($, phase, () => p)
 }
 
-async function listenerDir($: EngineInterface): Promise<string | undefined> {
+// venv interpreter: Windows layout first, then Linux/macOS
+const VENV_PYTHONS = ['.venv/Scripts/python.exe', '.venv/bin/python']
+
+async function listenerPython($: EngineInterface): Promise<{ dir: string; python: string } | undefined> {
   const fallback = await $.env.get('VOICE_WAKE_LISTENER_DIR')
   for (const d of [`${$.plugin.root}/../listener`, fallback]) {
     if (!d) continue
-    const st = await $.fs.stat(`${d}/.venv/Scripts/python.exe`).catch(() => undefined)
-    if (st) return d
+    for (const rel of VENV_PYTHONS) {
+      const st = await $.fs.stat(`${d}/${rel}`).catch(() => undefined)
+      if (st) return { dir: d, python: `${d}/${rel}` }
+    }
   }
   return undefined
 }
@@ -334,7 +343,7 @@ async function run($: EngineInterface) {
   }
   await setPhase($, 'loading')
   const proc = $.process.spawn({
-    argv: [`${dir}/.venv/Scripts/python.exe`, '-u', `${dir}/listen.py`],
+    argv: [python, '-u', `${dir}/listen.py`],
     cwd: dir,
     env: { PYTHONIOENCODING: 'utf-8' },
   })
@@ -429,7 +438,9 @@ export const register: Register = on => {
       description: 'Куда идёт голосовой ввод: без аргумента — список сессий, с номером — выбрать',
       argumentHint: '[номер сессии]',
     })
-    dir = await listenerDir($)
+    const found = await listenerPython($)
+    dir = found?.dir
+    python = found?.python ?? ''
     selfId = await $.session.id()
     if (dir) {
       const old = await readJson<Entry>($, `${reg()}/${selfId}.json`)

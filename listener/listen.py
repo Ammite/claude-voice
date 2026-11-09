@@ -262,7 +262,11 @@ def selftest_follow_desktop():
 
 
 def desktop_log_path(cfg):
-    return Path(cfg["desktop_log"] or Path(os.environ.get("LOCALAPPDATA", "")) / "Claude" / "Logs" / "main.log")
+    if cfg["desktop_log"]:
+        return Path(cfg["desktop_log"])
+    if sys.platform == "win32":
+        return Path(os.environ.get("LOCALAPPDATA", "")) / "Claude" / "Logs" / "main.log"
+    return Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "Claude" / "logs" / "main.log"
 
 
 def load_config():
@@ -401,10 +405,22 @@ def exit_with_parent():
     """Exit when the parent or the grandparent dies. On Windows the venv
     python.exe is a launcher whose child is the real interpreter, so the
     parent is the launcher and the grandparent is Claude: either one going
-    away would otherwise leave us holding the mic and the lock."""
+    away would otherwise leave us holding the mic and the lock.
+    On Linux the venv python is the interpreter itself: watch the parent only."""
     import ctypes
     import os
     import threading
+
+    if sys.platform != "win32":
+        ppid = os.getppid()
+
+        def poll():
+            while os.getppid() == ppid:  # reparented to init/subreaper once the parent dies
+                time.sleep(1)
+            os._exit(0)
+
+        threading.Thread(target=poll, daemon=True).start()
+        return
 
     k32 = ctypes.windll.kernel32
     k32.OpenProcess.restype = ctypes.c_void_p
@@ -498,9 +514,16 @@ class Listener:
 
     def beep(self, freq):
         if self.cfg["beep"]:
-            import winsound
+            if sys.platform == "win32":
+                import winsound
 
-            winsound.Beep(freq, 120)
+                winsound.Beep(freq, 120)
+                return
+            import numpy as np
+            import sounddevice as sd
+
+            t = np.arange(int(0.12 * 48000)) / 48000
+            sd.play((0.3 * np.sin(2 * np.pi * freq * t)).astype(np.float32), 48000, blocking=True)
 
     def heard_phrase(self, block):
         """Feed a block to the grammar recognizer; a grammar phrase once heard
@@ -655,10 +678,16 @@ class Listener:
         if not self.cfg["toast"]:
             return
         try:
+            msg = text[:200] or "(текст из поля ввода)"
+            title = "Отправлено" if submit else "Вставлено"
+            if sys.platform != "win32":
+                import subprocess
+
+                subprocess.run(["notify-send", "-a", "Claude Voice", title, msg], check=False, timeout=5)
+                return
             from winotify import Notification
 
-            msg = text[:200] or "(текст из поля ввода)"
-            Notification(app_id="Claude Voice", title="Отправлено" if submit else "Вставлено", msg=msg).show()
+            Notification(app_id="Claude Voice", title=title, msg=msg).show()
         except Exception as e:  # a toast is a nicety, never fatal
             log(f"toast failed: {e}")
 

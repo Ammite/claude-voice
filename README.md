@@ -232,3 +232,18 @@ worktree), ветка — из `.git/HEAD` без префикса `claude/`. У
 - Если вставить нельзя (открыт диалог), текст показывается во всплывающем сообщении в Claude.
 - Окружение: Windows (используются winsound, уведомления Windows, kernel32). Около 1 ГБ
   ОЗУ, пока работает слушатель.
+
+## Linux
+
+На Linux писк играется через `sounddevice`,
+уведомления — через `notify-send`, сессии открываются через `xdg-open`, лог
+Claude Desktop берётся из `~/.config/Claude/logs/main.log`.
+
+```bash
+sudo apt install libportaudio2 libnotify-bin python3-venv
+python3 listener/install.py
+listener/.venv/bin/python listener/listen.py
+```
+
+В `~/.claude/settings.json` путь к моду указывается через `:` вместо `;`:
+`{ "env": { "CLAUDE_CODE_PLUGIN_DIRS": "/path/to/claude-voice/mod" } }`.
