@@ -377,3 +377,57 @@ test('/claude-voice-off and /claude-voice-on turn voice input off and on', async
   expect(stored).toEqual([false, true])
   for (let i = 0; i < 20; i++) await (await $.ui.mount(BAND)).unmount()
 })
+
+test('with no choice, voice goes to the session Claude Desktop shows', async ($, on) => {
+  const { files } = engine(on, 'aaa')
+  const submits: string[] = []
+  on('prompt.read', () => ({ value: { text: '', cursor: 0 } }))
+  on('prompt.submit', (_, e) => {
+    submits.push(e.text)
+    return { text: e.text }
+  })
+  const reg = sessionsDir()
+  files.set(`${reg}/bbb.json`, JSON.stringify({ id: 'bbb', folder: 'other', label: '', seen: 1_000 }))
+  files.set(`${reg}/focused`, 'bbb')
+  on('process.spawn', async function* () {
+    yield { stream: 'stdout' as const, text: '{"status": "ready"}\n{"text": "привет", "submit": true}\n' }
+    await new Promise(() => {})
+    return { value: { code: 0, signal: null } }
+  })
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await until(async () => files.has(`${reg}/bbb.inbox`))
+  expect(JSON.parse(files.get(`${reg}/bbb.inbox`)!)).toMatchObject({ text: 'привет', submit: true })
+  expect(submits).toEqual([])
+  const listed = (await $.command.run(voiceTo(''))).text!
+  expect(listed).toContain('other (на экране) ← голос сюда')
+  // Let the routing set its ack timer before the test ends.
+  for (let i = 0; i < 20; i++) await (await $.ui.mount(BAND)).unmount()
+})
+
+test('choosing a session opens it in Claude Desktop; choosing the shown one clears the choice', async ($, on) => {
+  const { files } = engine(on, 'aaa')
+  const opened: string[][] = []
+  on('process.spawn', async function* (_, e) {
+    if (e.argv[0] === 'cmd') {
+      opened.push([...e.argv])
+      return { value: { code: 0, signal: null } }
+    }
+    await new Promise(() => {}) // the listener: stays quiet
+    return { value: { code: 0, signal: null } }
+  })
+  const reg = sessionsDir()
+  files.set(`${reg}/bbb.json`, JSON.stringify({ id: 'bbb', folder: 'other', label: '', seen: 1_000, since: 2 }))
+  files.set(`${reg}/focused`, 'aaa')
+  files.set(`${reg}/desktop-ids.json`, JSON.stringify({ bbb: 'local_b2', aaa: 'local_a1' }))
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+
+  await $.command.run(voiceTo('2')) // bbb: not on screen
+  expect(files.get(`${reg}/target`)).toBe('bbb')
+  await until(async () => opened.length > 0)
+  expect(opened).toEqual([['cmd', '/c', 'start', '', 'claude://claude.ai/epitaxy/local_b2']])
+
+  await $.command.run(voiceTo('1')) // this one, on screen: the default again, nothing to open
+  expect(files.get(`${reg}/target`)).toBe('')
+  expect(opened.length).toBe(1)
+  for (let i = 0; i < 20; i++) await (await $.ui.mount(BAND)).unmount()
+})

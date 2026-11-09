@@ -20,6 +20,8 @@ export type VoiceSession = {
   isTarget: boolean
   /** Its listener holds the mic. */
   hasMic: boolean
+  /** Claude Desktop shows it (from Desktop's log, read by the listener). */
+  isShown: boolean
 }
 
 /** What the band shows beside the phase. */

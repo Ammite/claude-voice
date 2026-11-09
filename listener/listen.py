@@ -58,6 +58,9 @@ DEFAULTS = {
     "speed": 1.0,
     "kokoro_model": "models/kokoro/kokoro-v1.0.onnx",
     "kokoro_voices": "models/kokoro/voices-v1.0.bin",
+    # Voice goes to the session Claude Desktop shows, read from its log; null = its default place.
+    "follow_desktop": True,
+    "desktop_log": None,
 }
 
 PUNCT = r"[\s,.!?:;-]*"
@@ -131,6 +134,99 @@ def take_cmd():
     return take(CMD_FILE)
 
 
+SESSIONS = HERE / "sessions"  # the mod's registry (see mod/hooks/register.tsx)
+# Claude Desktop's log is the only place that says which session is on screen.
+# ponytail: undocumented lines; if a Desktop update changes them, voice falls back
+# to the mic's session (the mod's default) and nothing else breaks.
+DESKTOP_MAP = re.compile(r"Mapping internal session (local_[\w-]+) to CLI session ([\w-]+)")
+DESKTOP_FOCUS = re.compile(r"setFocusedSession: sessionId=(local_[\w-]+)")
+
+
+def scan_desktop_log(lines, ids, focused=None):
+    """Read Claude Desktop's log lines: fill `ids` {Desktop id: CLI session id}
+    and return the session last put on screen (its Desktop id), else `focused`.
+    "sessionId=null" (between two sessions, the window hidden) keeps the last one."""
+    for line in lines:
+        m = DESKTOP_MAP.search(line)
+        if m:
+            ids[m[1]] = m[2]
+            continue
+        m = DESKTOP_FOCUS.search(line)
+        if m:
+            focused = m[1]
+    return focused
+
+
+def follow_desktop(path, reg=SESSIONS):
+    """Keep reg/focused = the CLI id of the session Desktop shows, and
+    reg/desktop-ids.json = {CLI id: Desktop id} (the mod opens a session by it).
+    Putting another session on screen drops the pane's choice (reg/target), so
+    voice follows the screen until the next choice."""
+    ids, focused, shown, written, pos, live = {}, None, None, None, 0, False
+    while True:
+        try:
+            size = path.stat().st_size
+            if size < pos:  # the log rotated (main.log -> main1.log at 10 MB)
+                pos = 0
+            if size > pos:
+                with open(path, "rb") as f:
+                    f.seek(pos)
+                    data = f.read()
+                end = data.rfind(b"\n") + 1  # whole lines only; the rest waits for its end
+                pos += end
+                known = len(ids)
+                focused = scan_desktop_log(data[:end].decode("utf-8", "replace").splitlines(), ids, focused)
+                if len(ids) != known:
+                    (reg / "desktop-ids.json").write_text(json.dumps({c: d for d, c in ids.items()}), encoding="utf-8")
+            if live and focused != shown and ids.get(focused):
+                target = reg / "target"
+                if target.exists() and target.read_text(encoding="utf-8").strip() not in ("", ids[focused]):
+                    target.write_text("", encoding="utf-8")
+            if ids.get(focused):
+                shown = focused
+            cli = ids.get(focused)
+            if cli and cli != written:
+                (reg / "focused").write_text(cli, encoding="utf-8")
+                written = cli
+                log(f"desktop shows session {cli}")
+            live = True  # what was in the log before this run is not a switch
+        except OSError as e:
+            log(f"desktop log: {e}")
+        time.sleep(0.5)
+
+
+def selftest_follow_desktop():
+    """follow_desktop on a log in a temp folder: what was on screen before the
+    run keeps the pane's choice; a switch during the run drops it."""
+    import tempfile
+    import threading
+
+    with tempfile.TemporaryDirectory() as d:
+        reg, path = Path(d), Path(d) / "main.log"
+        path.write_text(
+            "Mapping internal session local_a1 to CLI session cli-a\n"
+            "Mapping internal session local_b2 to CLI session cli-b\n"
+            "LocalSessions.setFocusedSession: sessionId=local_a1\n",
+            encoding="utf-8",
+        )
+        (reg / "target").write_text("cli-b", encoding="utf-8")  # chosen in the pane
+        threading.Thread(target=follow_desktop, args=(path, reg), daemon=True).start()
+        time.sleep(0.8)
+        assert (reg / "focused").read_text(encoding="utf-8") == "cli-a"
+        assert (reg / "target").read_text(encoding="utf-8") == "cli-b"  # the start is not a switch
+        assert json.loads((reg / "desktop-ids.json").read_text(encoding="utf-8")) == {"cli-a": "local_a1", "cli-b": "local_b2"}
+        (reg / "target").write_text("cli-a", encoding="utf-8")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write("LocalSessions.setFocusedSession: sessionId=null\nLocalSessions.setFocusedSession: sessionId=local_b2\n")
+        time.sleep(0.8)
+        assert (reg / "focused").read_text(encoding="utf-8") == "cli-b"
+        assert (reg / "target").read_text(encoding="utf-8") == ""  # another session on screen: the choice goes
+
+
+def desktop_log_path(cfg):
+    return Path(cfg["desktop_log"] or Path(os.environ.get("LOCALAPPDATA", "")) / "Claude" / "Logs" / "main.log")
+
+
 def load_config():
     cfg = dict(DEFAULTS)
     p = HERE / "config.json"
@@ -176,6 +272,17 @@ def selftest():
         "Key principles include KISS,", "DRY, YAGNI, statelessness,", "and the CAP theorem."]
     assert speech_pieces("Done.") == ["Done."]
     assert command_phrases()["клод перейди на сессию три"] == {"cmd": "session", "n": 3}
+    ids = {}
+    desktop = [
+        "2026-11-09 20:24:29 [info] Mapping internal session local_a1 to CLI session 91c0fcb7-0985",
+        "2026-11-09 20:24:30 [info] [CCD] LocalSessions.setFocusedSession: sessionId=local_a1",
+        "2026-11-09 20:24:31 [info] [CCD] LocalSessions.setFocusedSession: sessionId=null",
+        "2026-11-09 20:24:31 [info] [WarmLifecycle:preview] Warming up session local_b2",
+    ]
+    assert scan_desktop_log(desktop, ids) == "local_a1"  # null between switches keeps the last
+    assert ids == {"local_a1": "91c0fcb7-0985"}
+    assert scan_desktop_log(["[CCD] LocalSessions.setFocusedSession: sessionId=local_b2"], ids, "local_a1") == "local_b2"
+    selftest_follow_desktop()
 
     class Rec:  # a Vosk recognizer that plays back (final?, text) per block
         def __init__(self, script):
@@ -636,6 +743,10 @@ def main():
     global LOG_FILE
     LOG_FILE = HERE / "listen.log"
     LOG_FILE.write_text("", encoding="utf-8")  # one run per file
+    if cfg["follow_desktop"]:
+        import threading
+
+        threading.Thread(target=follow_desktop, args=(desktop_log_path(cfg),), daemon=True).start()
     try:
         run_mic(cfg)
     except KeyboardInterrupt:

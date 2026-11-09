@@ -17,7 +17,7 @@ const SPEAK = '🔊'
 const SPEECH_RULE = `Voice replies: a user message that starts with ${VOICE_MARK} was dictated by voice, and one line of your reply to it is read aloud by an English text-to-speech voice when the reply is done. For such messages only, begin your final reply (the text after your last tool call) with one line: "${SPEAK} " followed by one short plain-English sentence (at most 50 words) giving the outcome or the answer, even when the rest of the reply is in another language. No markdown, code, file paths or URLs in that line. Never add it to messages without ${VOICE_MARK}.`
 
 const phase = atom({ plugin: 'voice-wake', key: 'phase' } as const, 'off', { shape: 'phase-1' })
-const sessions = atom({ plugin: 'voice-wake', key: 'sessions' } as const, [], { shape: 'sessions-3' })
+const sessions = atom({ plugin: 'voice-wake', key: 'sessions' } as const, [], { shape: 'sessions-4' })
 const view = atom({ plugin: 'voice-wake', key: 'view' } as const, { said: '', err: '', elapsed: 0 }, { shape: 'view-2' })
 
 const STATUS: Record<Phase, string> = {
@@ -63,8 +63,11 @@ let inboxSeen: number | undefined // seq of the last inbox message taken here
 //   <id>.json   each session's heartbeat (folder, last prompt, time)
 //   <id>.inbox  the last message routed to it: { seq, text, submit }
 //   <id>.ack    the seq it took; none within ACK_MS and the sender delivers it itself
-//   target      the id voice input goes to; empty or stale = the mic's own session
+//   target      the id chosen in the pane; empty or stale = the shown session (below)
 //   owner       the session whose listener holds the mic
+//   focused     the session Claude Desktop shows; the listener writes it (and
+//               drops `target` when another session is put on screen)
+//   desktop-ids.json  { session id: Desktop's local_ id }, to open one in Desktop
 // ponytail: $.fs cannot delete, so files of closed sessions stay (a few hundred bytes each).
 const reg = () => `${dir}/sessions`
 
@@ -89,15 +92,25 @@ async function aliveEntries($: EngineInterface): Promise<Entry[]> {
   return entries.filter((e): e is Entry => !!e && !e.closed && now - e.seen < STALE_MS)
 }
 
-async function refreshSessions($: EngineInterface) {
-  if (!dir) return
-  const [alive, chosen, owner] = await Promise.all([
+/** Where voice goes: the session chosen in the pane, else the one Claude Desktop
+ * shows (the listener reads that from Desktop's log), else the mic's session.
+ * A choice or a shown session without the mod running falls through. */
+async function voiceTarget($: EngineInterface) {
+  const [alive, chosen, focused, owner] = await Promise.all([
     aliveEntries($),
     readTarget($),
-    $.fs.read(`${reg()}/owner`).catch(() => ''),
+    $.fs.read(`${reg()}/focused`).then(t => t.trim(), () => ''),
+    $.fs.read(`${reg()}/owner`).then(t => t.trim(), () => ''),
   ])
-  // No choice (or a closed one): voice goes to the mic's session.
-  const target = alive.some(e => e.id === chosen) ? chosen : owner.trim()
+  const isAlive = (id: string) => !!id && alive.some(e => e.id === id)
+  const shown = isAlive(focused) ? focused : ''
+  const target = isAlive(chosen) ? chosen : shown || owner
+  return { alive, target, owner, shown }
+}
+
+async function refreshSessions($: EngineInterface) {
+  if (!dir) return
+  const { alive, target, owner, shown } = await voiceTarget($)
   // This session first, then the others in the order they appeared: a new one
   // goes last, so the numbers already shown stay. The place is /claude-voice-to's number.
   const order = alive.sort(
@@ -111,7 +124,8 @@ async function refreshSessions($: EngineInterface) {
     name: names.indexOf(names[i]) === names.lastIndexOf(names[i]) ? names[i] : `${names[i]} (${e.id.slice(0, 4)})`,
     isSelf: e.id === selfId,
     isTarget: e.id === target,
-    hasMic: e.id === owner.trim(),
+    hasMic: e.id === owner,
+    isShown: e.id === shown,
   }))
   await update($, sessions, () => list)
 }
@@ -147,12 +161,30 @@ async function heartbeat($: EngineInterface, closed = false) {
   if (!closed) await refreshSessions($)
 }
 
+/** Send voice to session `id` and put it on screen in Claude Desktop. Choosing
+ * the default (the shown session, else the mic's) clears the choice. */
 async function select($: EngineInterface, id: string) {
   if (!dir) return
-  // Choosing the mic's session is the default: voice then follows the mic.
-  const owner = (await $.fs.read(`${reg()}/owner`).catch(() => '')).trim()
-  await $.fs.write(`${reg()}/target`, id === owner ? '' : id)
+  const { shown, owner } = await voiceTarget($)
+  await $.fs.write(`${reg()}/target`, id === (shown || owner) ? '' : id)
+  if (id !== shown) await openInDesktop($, id)
   await refreshSessions($)
+}
+
+/** Open a session in Claude Desktop by its link; its Desktop id comes from the
+ * listener's reading of Desktop's log. Unknown (no listener, an old log): nothing. */
+async function openInDesktop($: EngineInterface, id: string) {
+  const desktopId = (await readJson<Record<string, string>>($, `${reg()}/desktop-ids.json`))?.[id]
+  if (!desktopId || !/^local_[\w-]+$/.test(desktopId)) return
+  const proc = $.process.spawn({ argv: ['cmd', '/c', 'start', '', `claude://claude.ai/epitaxy/${desktopId}`] })
+  // ponytail: a failed start (no claude:// handler) is only logged; the choice still holds.
+  void (async () => {
+    try {
+      for await (const _ of proc);
+    } catch (err) {
+      $.ui.log(`voice-wake: could not open the session: ${String(err)}`)
+    }
+  })()
 }
 
 async function checkInbox($: EngineInterface) {
@@ -273,11 +305,11 @@ async function deliver($: EngineInterface, line: Line) {
   if (!filled.isFilled) $.ui.toast(`🎙 не вставилось (${filled.refusal ?? 'unknown'}): ${spoken}`)
 }
 
-/** Deliver here, or to the session chosen in the sessions pane. */
+/** Deliver here, or to the session voice goes to (`voiceTarget`). */
 async function route($: EngineInterface, line: Line) {
-  const target = await readTarget($)
+  const { alive, target } = await voiceTarget($)
   if (target && target !== selfId) {
-    const entry = (await aliveEntries($)).find(e => e.id === target)
+    const entry = alive.find(e => e.id === target)
     if (entry) {
       const seq = await $.clock.now()
       await $.fs.write(`${reg()}/${target}.inbox`, JSON.stringify({ seq, ...line }))
@@ -289,7 +321,6 @@ async function route($: EngineInterface, line: Line) {
       })
       return
     }
-    $.ui.toast('🎙 выбранная сессия закрыта: текст вставлен сюда')
   }
   await deliver($, line)
 }
@@ -461,7 +492,7 @@ export const register: Register = on => {
     const n = Number.parseInt(e.args.trim(), 10)
     if (Number.isNaN(n)) {
       void openPane($)
-      const tags = (s: VoiceSession) => [s.isSelf && 'эта', s.hasMic && 'микрофон'].filter(Boolean).join(', ')
+      const tags = (s: VoiceSession) => [s.isSelf && 'эта', s.isShown && 'на экране', s.hasMic && 'микрофон'].filter(Boolean).join(', ')
       return {
         text:
           list.map((s, i) => `${i + 1}. ${s.name}${tags(s) ? ` (${tags(s)})` : ''}${s.isTarget ? ' ← голос сюда' : ''}`).join('\n') ||
@@ -494,12 +525,17 @@ export const register: Register = on => {
             >
               {s.isTarget ? '✓ ' : '   '}
               {`${i + 1}. ${s.name} `}
-              <Text dimColor>{[s.isSelf ? 'эта' : '', s.hasMic ? '🎙 микрофон' : ''].filter(Boolean).join(' · ')}</Text>
+              <Text dimColor>
+                {[s.isSelf ? 'эта' : '', s.isShown ? 'на экране' : '', s.hasMic ? '🎙 микрофон' : ''].filter(Boolean).join(' · ')}
+              </Text>
             </Button>
           ))}
         </Box>
         {list.length === 0 && <Text dimColor>Нет сессий с модом.</Text>}
-        <Text dimColor>Без выбора голос идёт в сессию с микрофоном. Номер = /claude-voice-to n или «Клод, сессия n».</Text>
+        <Text dimColor>
+          Голос идёт в сессию на экране Claude Desktop. Выбор здесь открывает сессию и держится, пока не переключишься
+          на другую. Номер = /claude-voice-to n или «Клод, сессия n».
+        </Text>
       </Box>
     )
   })
