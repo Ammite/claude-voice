@@ -443,6 +443,14 @@ def rms(block):
     return float(np.sqrt(np.mean(block.astype(np.float32) ** 2)))
 
 
+def nvidia_dir():
+    """Where the nvidia-* pip packages put their libraries in this venv."""
+    if sys.platform == "win32":
+        return Path(sys.prefix) / "Lib" / "site-packages" / "nvidia"
+    v = sys.version_info
+    return Path(sys.prefix) / "lib" / f"python{v.major}.{v.minor}" / "site-packages" / "nvidia"
+
+
 def load_whisper(path, device):
     """faster-whisper on the GPU (float16) if it works, else on the CPU (int8).
     The CUDA DLLs come from the nvidia-cublas/cudnn pip packages; a missing DLL
@@ -450,12 +458,23 @@ def load_whisper(path, device):
     import numpy as np
     from faster_whisper import WhisperModel
 
-    nvidia = Path(sys.prefix) / "Lib" / "site-packages" / "nvidia"
+    nvidia = nvidia_dir()
     # "auto" without the CUDA libraries (install.py skips them with no NVIDIA card): CPU, no try.
     if device == "cuda" or (device == "auto" and nvidia.exists()):
-        for bin_dir in nvidia.glob("*/bin"):
-            os.add_dll_directory(str(bin_dir))
-            os.environ["PATH"] = f"{bin_dir}{os.pathsep}{os.environ['PATH']}"
+        if sys.platform == "win32":
+            for bin_dir in nvidia.glob("*/bin"):
+                os.add_dll_directory(str(bin_dir))
+                os.environ["PATH"] = f"{bin_dir}{os.pathsep}{os.environ['PATH']}"
+        else:
+            # LD_LIBRARY_PATH is read only at process start: load the pip CUDA
+            # libraries by path now, so ctranslate2's dlopen finds them loaded.
+            import ctypes
+
+            for lib in sorted(nvidia.glob("*/lib/lib*.so*")):
+                try:
+                    ctypes.CDLL(str(lib), mode=ctypes.RTLD_GLOBAL)
+                except OSError:
+                    pass  # an optional library (nvblas and the like) may not load; the needed ones do
         try:
             m = WhisperModel(path, device="cuda", compute_type="float16")
             list(m.transcribe(np.zeros(RATE, dtype="float32"), language="ru")[0])
