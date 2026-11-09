@@ -23,9 +23,12 @@ import sys
 import time
 from pathlib import Path
 
+import cloud
+
 HERE = Path(__file__).resolve().parent
 RATE = 16000
 BLOCK = 1600  # 0.1 s
+STT_MAX_FAILURES = 3  # cloud recognition failures in a row before staying on whisper
 STOP_BLOCKS = 3  # the stop phrase in this many partial results in a row counts as said
 
 DEFAULTS = {
@@ -38,7 +41,12 @@ DEFAULTS = {
     "submit_word": "отправь",  # with submit_on_end false: "…, отправь, приём" sends
     "vosk_model": "models/vosk-model-small-ru-0.22",
     "whisper_model": "models/faster-whisper-small",
-    "language": "ru",  # "ru", "en" or "auto"
+    "language": "ru",  # dictation: "ru", "en", … or "auto"
+    "stt": "whisper",  # dictation recognizer: "whisper" (local) or "soniox" (cloud, needs SONIOX_API_KEY)
+    "tts": "kokoro",  # reply voice: "kokoro" (local, English only) or "soniox" (cloud, any language)
+    "reply_language": "en",  # language of the spoken reply line: "en", "ru", …; the mod reads it at start
+    "soniox_voice": "Kirill",  # a Soniox voice
+    "soniox_terms": ["Claude"],  # words Soniox should spell right
     "whisper_device": "auto",  # "auto" (GPU if it works, else CPU), "cuda" or "cpu"
     "beam_size": 5,  # 1 is faster, 5 makes fewer gross mistakes
     # Words you say often: whisper leans toward them. Not the end word: on near
@@ -297,7 +305,65 @@ def clean(text, submit_word, end_word="приём"):
     return text, submit
 
 
+def selftest_cloud_fallback():
+    """Soniox first; whisper on a failure; a bad key or STT_MAX_FAILURES in a row: whisper for good."""
+    import numpy as np
+
+    class Seg:
+        text = "локально"
+
+    class Whisper:
+        def transcribe(self, audio, **kw):
+            return [Seg()], None
+
+    def listener(stt="soniox", tts="kokoro", reply="en", key="k"):
+        lst = Listener.__new__(Listener)
+        lst.cfg = {**DEFAULTS, "stt": stt, "tts": tts, "reply_language": reply}
+        real = cloud.load_key
+        cloud.load_key = lambda: key
+        try:
+            lst.setup_cloud()
+        finally:
+            cloud.load_key = real
+        lst.whisper = Whisper()
+        return lst
+
+    real = cloud.transcribe
+    replies = []
+
+    def fake(audio, key, language, terms):
+        r = replies.pop(0)
+        if isinstance(r, Exception):
+            raise r
+        return r
+
+    cloud.transcribe = fake
+    try:
+        audio = np.zeros(10, dtype=np.int16)
+        lst = listener()
+        replies[:] = ["облако", cloud.CloudError("net"), "облако"]
+        assert [lst.transcribe(audio) for _ in range(3)] == ["облако", "локально", "облако"]
+        assert lst.cloud_stt
+        replies[:] = [cloud.CloudError("net")] * STT_MAX_FAILURES
+        for _ in range(STT_MAX_FAILURES):
+            lst.transcribe(audio)
+        assert not lst.cloud_stt and replies == []
+        lst = listener()
+        replies[:] = [cloud.CloudError("401", fatal=True)]
+        assert lst.transcribe(audio) == "локально" and not lst.cloud_stt
+        assert lst.transcribe(audio) == "локально"  # no second cloud call: replies would be empty
+    finally:
+        cloud.transcribe = real
+
+    assert not listener(key="").cloud_stt  # chosen, but no key: local
+    assert not listener(stt="whisper").cloud_stt
+    assert listener(tts="soniox", reply="ru").cloud_tts
+    assert not listener(reply="ru").kokoro_can_speak() and listener().kokoro_can_speak()
+
+
 def selftest():
+    cloud.selftest()
+    selftest_cloud_fallback()
     w = "отправь"
     assert clean("Клод, приём. Привет, приём.", w) == ("Привет", False)
     assert clean("Клод прием, привет мир. Отправь. Прием.", w) == ("Привет мир", True)
@@ -505,10 +571,30 @@ class Listener:
         grammar = [self.wake, self.text_only, self.stop, *self.commands, "[unk]"]
         self.rec = KaldiRecognizer(self.vosk, RATE, json.dumps(grammar, ensure_ascii=False))
         self.end_rec = KaldiRecognizer(self.vosk, RATE)  # free decoding: only marks pauses
-        log("loading whisper...")
-        self.whisper = load_whisper(str(HERE / cfg["whisper_model"]), cfg["whisper_device"])
+        self.setup_cloud()
+        self.whisper = None
+        if not self.cloud_stt:
+            self.load_whisper()
         self.history = []  # recent blocks for preroll
         self.start_tts()
+
+    def setup_cloud(self):
+        """Soniox for what the config asks, when there is a key; else the local engines."""
+        c = self.cfg
+        wants = c["stt"] == "soniox" or c["tts"] == "soniox"
+        self.key = cloud.load_key() if wants else ""
+        if wants and not self.key:
+            log("no SONIOX_API_KEY (env or ~/.config/soniox.env): using whisper and kokoro")
+        self.cloud_stt = c["stt"] == "soniox" and bool(self.key)
+        self.cloud_tts = c["tts"] == "soniox" and bool(self.key)
+        self.stt_failures = 0
+
+    def load_whisper(self):
+        log("loading whisper...")
+        self.whisper = load_whisper(str(HERE / self.cfg["whisper_model"]), self.cfg["whisper_device"])
+
+    def kokoro_can_speak(self):
+        return self.cfg["reply_language"] == "en"
 
     def start_tts(self):
         """Load and warm Kokoro in the background, so the first reply speaks without the ~3 s load."""
@@ -516,7 +602,11 @@ class Listener:
 
         self.tts = None
         self.tts_loader = threading.Thread(target=self.load_tts, daemon=True)
-        if self.cfg["speak"]:
+        if not hasattr(self, "cloud_tts"):
+            self.setup_cloud()
+        if self.cfg["speak"] and not self.cloud_tts and not self.kokoro_can_speak():
+            log(f"kokoro speaks English only, reply_language is {self.cfg['reply_language']!r}: replies are not spoken")
+        elif self.cfg["speak"] and not self.cloud_tts:
             self.tts_loader.start()
 
     def tts_lang(self):
@@ -622,6 +712,20 @@ class Listener:
         return np.concatenate(out), False
 
     def transcribe(self, audio):
+        """Soniox when chosen; whisper after a failure. A bad key, or STT_MAX_FAILURES
+        failures in a row, leaves the cloud for the rest of the run."""
+        if self.cloud_stt:
+            try:
+                text = cloud.transcribe(audio, self.key, self.cfg["language"], self.cfg["soniox_terms"])
+                self.stt_failures = 0
+                return text
+            except cloud.CloudError as e:
+                self.stt_failures += 1
+                if e.fatal or self.stt_failures >= STT_MAX_FAILURES:
+                    self.cloud_stt = False
+                log(f"soniox failed ({e}); whisper {'from now on' if not self.cloud_stt else 'this time'}")
+        if self.whisper is None:
+            self.load_whisper()  # the first fallback waits for the model load
         lang = None if self.cfg["language"] == "auto" else self.cfg["language"]
         segs, _ = self.whisper.transcribe(
             audio.astype("float32") / 32768.0,
@@ -666,16 +770,38 @@ class Listener:
         import sounddevice as sd
 
         c = self.cfg
-        if self.tts_loader.is_alive():
-            self.tts_loader.join()
-        if self.tts is None:  # not preloaded, or the preload failed: load here, errors and all
-            self.load_tts()
+        if not self.cloud_tts and not self.kokoro_can_speak():
+            log(f"not spoken (no voice for {c['reply_language']!r}): {text}")
+            return
         ready = queue.Queue()
 
+        def kokoro(piece):
+            if self.tts_loader.is_alive():
+                self.tts_loader.join()
+            if self.tts is None:  # not preloaded, or the preload failed: load here, errors and all
+                self.load_tts()
+            return self.tts.create(piece, voice=c["voice"], speed=c["speed"], lang=self.tts_lang())
+
+        def piece_audio(piece):
+            if self.cloud_tts:
+                try:
+                    return cloud.synthesize(piece, self.key, c["reply_language"], c["soniox_voice"])
+                except cloud.CloudError as e:
+                    if e.fatal:
+                        self.cloud_tts = False
+                    log(f"soniox voice failed ({e})")
+                    if not self.kokoro_can_speak():
+                        return None
+            return kokoro(piece)
+
         def synth():
-            for piece in speech_pieces(text):
-                ready.put(self.tts.create(piece, voice=c["voice"], speed=c["speed"], lang=self.tts_lang()))
-            ready.put(None)
+            try:
+                for piece in speech_pieces(text):
+                    if (item := piece_audio(piece)) is None:
+                        break
+                    ready.put(item)
+            finally:
+                ready.put(None)
 
         self.last_said = text
         threading.Thread(target=synth, daemon=True).start()
@@ -814,8 +940,10 @@ def main():
     if "--say" in args:
         lst = Listener.__new__(Listener)  # no vosk or whisper needed to speak
         lst.cfg = cfg
+        lst.setup_cloud()
         lst.start_tts()
-        lst.tts_loader.join()
+        if lst.tts_loader.is_alive():
+            lst.tts_loader.join()
         t = time.time()
         lst.speak(args[args.index("--say") + 1])
         log(f"spoke in {time.time() - t:.1f} s")
