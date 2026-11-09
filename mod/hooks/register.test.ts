@@ -502,6 +502,8 @@ test('the spoken line is asked for in reply_language from listener/config.json',
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
   await spawned
   expect(await speechRule($)).toContain('in Russian')
+  // asked to be told by voice: a later reply that reports the work done speaks too
+  expect(await speechRule($)).toContain('told by voice once some work is done')
 })
 
 test('without a config, or with a broken one, the spoken line is in English', async ($, on) => {

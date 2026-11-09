@@ -18,7 +18,7 @@ const SPEAK = '🔊'
 const LANGUAGES: Record<string, string> = { en: 'English', ru: 'Russian', kk: 'Kazakh', uk: 'Ukrainian', de: 'German', fr: 'French', es: 'Spanish' }
 function speechRule(language = 'en') {
   const name = LANGUAGES[language] ?? language
-  return `Voice replies: a user message that starts with ${VOICE_MARK} was dictated by voice, and one line of your reply to it is read aloud by a text-to-speech voice when the reply is done. For such messages only, begin your final reply (the text after your last tool call) with one line: "${SPEAK} " followed by one short plain sentence in ${name} (at most 50 words) giving the outcome or the answer, even when the rest of the reply is in another language. No markdown, code, file paths or URLs in that line. Never add it to messages without ${VOICE_MARK}.`
+  return `Voice replies: a user message that starts with ${VOICE_MARK} was dictated by voice, and one line of your reply to it is read aloud by a text-to-speech voice when the reply is done. For such messages only, begin your final reply (the text after your last tool call) with one line: "${SPEAK} " followed by one short plain sentence in ${name} (at most 50 words) giving the outcome or the answer, even when the rest of the reply is in another language. No markdown, code, file paths or URLs in that line. Never add it to messages without ${VOICE_MARK}, with one exception: when the user asked to be told by voice once some work is done (for example \"скажи голосом, когда закончишь\"), the reply that reports that work finished gets the line too, even when a background task's notification, not a user message, started it.`
 }
 
 const phase = atom({ plugin: 'voice-wake', key: 'phase' } as const, 'off', { shape: 'phase-1' })
