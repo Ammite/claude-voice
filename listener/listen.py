@@ -400,6 +400,10 @@ class Listener:
         for b in blocks:
             out.append(b)
             t += len(b) / RATE
+            if self.heard_phrase(b) == self.stop:  # «Клод, стоп» mid-message: drop it, stop Claude too
+                log("stop phrase while recording")
+                emit({"stop": True})
+                return None, False
             if self.end_rec.AcceptWaveform(b.tobytes()):
                 heard = json.loads(self.end_rec.Result()).get("text", "")
                 if heard:

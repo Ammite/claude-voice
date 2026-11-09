@@ -7,3 +7,5 @@ listener/listen.log
 listener/cmd
 listener/sessions/*
 !listener/sessions/.gitkeep
+listener/said
+listener/say
