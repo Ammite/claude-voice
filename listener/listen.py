@@ -157,41 +157,64 @@ def scan_desktop_log(lines, ids, focused=None):
     return focused
 
 
+def read_lines(path, pos):
+    """The whole lines of `path` from byte `pos` (a partial last line waits for
+    its end): (lines, the new pos)."""
+    with open(path, "rb") as f:
+        f.seek(pos)
+        data = f.read()
+    end = data.rfind(b"\n") + 1
+    return data[:end].decode("utf-8", "replace").splitlines(), pos + end
+
+
 def follow_desktop(path, reg=SESSIONS):
-    """Keep reg/focused = the CLI id of the session Desktop shows, and
-    reg/desktop-ids.json = {CLI id: Desktop id} (the mod opens a session by it).
-    Putting another session on screen drops the pane's choice (reg/target), so
-    voice follows the screen until the next choice."""
-    ids, focused, shown, written, pos, live = {}, None, None, None, 0, False
+    """Keep reg/focused = the CLI id of the session Desktop shows ('' when its id
+    is not known: the mod then uses the mic's session), and reg/desktop-ids.json =
+    {CLI id: Desktop id} (the mod opens a session by it). Putting another session
+    on screen drops the pane's choice (reg/target), so voice follows the screen
+    until the next choice."""
+    ids, focused, pos, started = {}, None, 0, False
+    shown = None
+    put = {}  # file name -> text written there; a failed write is tried again
+    err = None
+    # main1.log: the log before the last rotation, with the mappings of older sessions.
+    older = path.with_name(f"{path.stem}1{path.suffix}")
+
+    def write(name, text):
+        if put.get(name) != text:
+            (reg / name).write_text(text, encoding="utf-8")
+            put[name] = text
+
+    try:
+        focused = scan_desktop_log(read_lines(older, 0)[0], ids)
+    except OSError:
+        pass  # no older log: fine
     while True:
         try:
-            size = path.stat().st_size
-            if size < pos:  # the log rotated (main.log -> main1.log at 10 MB)
+            if path.stat().st_size < pos:
+                # Rotated: the file we read is main1.log now. Its tail after our
+                # last look first, then the new main.log from its start.
+                if older.exists():
+                    focused = scan_desktop_log(read_lines(older, pos)[0], ids, focused)
                 pos = 0
-            if size > pos:
-                with open(path, "rb") as f:
-                    f.seek(pos)
-                    data = f.read()
-                end = data.rfind(b"\n") + 1  # whole lines only; the rest waits for its end
-                pos += end
-                known = len(ids)
-                focused = scan_desktop_log(data[:end].decode("utf-8", "replace").splitlines(), ids, focused)
-                if len(ids) != known:
-                    (reg / "desktop-ids.json").write_text(json.dumps({c: d for d, c in ids.items()}), encoding="utf-8")
-            if live and focused != shown and ids.get(focused):
+            lines, pos = read_lines(path, pos)
+            focused = scan_desktop_log(lines, ids, focused)
+            if started and focused != shown:
+                # ponytail: a choice made in the same instant can be lost (a few ms); choose again.
                 target = reg / "target"
-                if target.exists() and target.read_text(encoding="utf-8").strip() not in ("", ids[focused]):
+                if target.exists() and target.read_text(encoding="utf-8", errors="replace").strip() not in ("", ids.get(focused, "")):
                     target.write_text("", encoding="utf-8")
-            if ids.get(focused):
-                shown = focused
-            cli = ids.get(focused)
-            if cli and cli != written:
-                (reg / "focused").write_text(cli, encoding="utf-8")
-                written = cli
-                log(f"desktop shows session {cli}")
-            live = True  # what was in the log before this run is not a switch
-        except OSError as e:
-            log(f"desktop log: {e}")
+            shown, started = focused, True  # what the log held before this run is not a switch
+            write("desktop-ids.json", json.dumps({c: d for d, c in ids.items()}))
+            cli = ids.get(focused, "")
+            if put.get("focused") != cli:
+                log(f"desktop shows session {cli or '(id not in the log)'}")
+            write("focused", cli)
+            err = None
+        except Exception as e:  # keep following; each new trouble is logged once
+            if str(e) != err:
+                err = str(e)
+                log(f"desktop log: {e}")
         time.sleep(0.5)
 
 
@@ -201,7 +224,8 @@ def selftest_follow_desktop():
     import tempfile
     import threading
 
-    with tempfile.TemporaryDirectory() as d:
+    # The follower thread outlives the test (daemon): the folder may still be open on cleanup.
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
         reg, path = Path(d), Path(d) / "main.log"
         path.write_text(
             "Mapping internal session local_a1 to CLI session cli-a\n"
@@ -221,6 +245,20 @@ def selftest_follow_desktop():
         time.sleep(0.8)
         assert (reg / "focused").read_text(encoding="utf-8") == "cli-b"
         assert (reg / "target").read_text(encoding="utf-8") == ""  # another session on screen: the choice goes
+        # A session whose mapping this log lacks: not the previous one, but none (the mod uses the mic's).
+        (reg / "target").write_text("cli-b", encoding="utf-8")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write("LocalSessions.setFocusedSession: sessionId=local_c3\n")
+        time.sleep(0.8)
+        assert (reg / "focused").read_text(encoding="utf-8") == ""
+        assert (reg / "target").read_text(encoding="utf-8") == ""
+        # Rotation: what was added just before main.log became main1.log still counts.
+        with open(path, "a", encoding="utf-8") as f:
+            f.write("Mapping internal session local_c3 to CLI session cli-c\n")
+        path.rename(reg / "main1.log")
+        path.write_text("startup\n", encoding="utf-8")
+        time.sleep(0.8)
+        assert (reg / "focused").read_text(encoding="utf-8") == "cli-c"
 
 
 def desktop_log_path(cfg):
